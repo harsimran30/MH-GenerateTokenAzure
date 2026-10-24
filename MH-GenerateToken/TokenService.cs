@@ -7,9 +7,19 @@ using Microsoft.IdentityModel.Tokens;
 namespace MH_GenerateToken
 {
     /// <summary>
+    /// The requested certificate is missing from the store or cannot be used for signing.
+    /// </summary>
+    internal class CertificateException : Exception
+    {
+        public CertificateException(string message) : base(message)
+        {
+        }
+    }
+
+    /// <summary>
     /// Generate and Validate Token
     /// </summary>
-    internal class TokenService
+    internal class TokenService : IDisposable
     {
         /// <summary>
         /// Initialise Token Service
@@ -17,13 +27,25 @@ namespace MH_GenerateToken
         /// <param name="appID"></param>
         /// <param name="endpoint"></param>
         /// <param name="thumbprint"></param>
+        /// <exception cref="CertificateException">No usable certificate with this thumbprint.</exception>
         public TokenService(string appID, string endpoint, string thumbprint)
         {
+            if (string.IsNullOrWhiteSpace(appID))
+                throw new ArgumentNullException(nameof(appID));
+
+            if (string.IsNullOrWhiteSpace(endpoint))
+                throw new ArgumentNullException(nameof(endpoint));
+
+            if (string.IsNullOrWhiteSpace(thumbprint))
+                throw new ArgumentNullException(nameof(thumbprint));
+
             AppId = appID;
             EndPoint = endpoint;
-            Thumbprint = thumbprint;
             ExpiryMinutes = 60;
-            FetchCertificate();
+            X509Cert = FindCertificate(thumbprint);
+
+            // ... Key to Validate JWT. Its key id is the thumbprint, matching the kid/x5t header on the token.
+            PublicKey = new X509SecurityKey(X509Cert);
         }
 
         /// <summary>
@@ -32,34 +54,26 @@ namespace MH_GenerateToken
         /// <returns></returns>
         internal string GenerateToken()
         {
-            try
+            // ... Build ClaimSet
+            var claims = new ClaimsIdentity(new Claim[]
             {
-                // ... Build ClaimSet
-                var claims = new ClaimsIdentity(new Claim[]
-                {
-                new Claim( JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString() ),
-                new Claim( JwtRegisteredClaimNames.Sub, AppId )
-                });
+                new Claim(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString()),
+                new Claim(JwtRegisteredClaimNames.Sub, AppId)
+            });
 
-                // ... Build Token Descriptor
-                var securityTokenDescriptor = new SecurityTokenDescriptor
-                {
-                    Subject = claims,
-                    Audience = EndPoint,
-                    Issuer = AppId,
-                    NotBefore = DateTime.Now,
-                    Expires = DateTime.Now.AddMinutes(ExpiryMinutes),
-                    SigningCredentials = new X509SigningCredentials(X509Cert)
-                };
-
-                // ... Build JWT Token
-                var handler = new JsonWebTokenHandler();
-                return handler.CreateToken(securityTokenDescriptor);
-            }
-            catch (Exception ex)
+            // ... Build Token Descriptor
+            var securityTokenDescriptor = new SecurityTokenDescriptor
             {
-                throw new Exception("Failed in Generate JWT, error " + ex.Message);
-            }
+                Subject = claims,
+                Audience = EndPoint,
+                Issuer = AppId,
+                NotBefore = DateTime.UtcNow,
+                Expires = DateTime.UtcNow.AddMinutes(ExpiryMinutes),
+                SigningCredentials = new X509SigningCredentials(X509Cert)
+            };
+
+            // ... Build JWT Token
+            return new JsonWebTokenHandler().CreateToken(securityTokenDescriptor);
         }
 
         /// <summary>
@@ -71,65 +85,50 @@ namespace MH_GenerateToken
         {
             if (string.IsNullOrEmpty(token))
                 throw new ArgumentException("Given token is null or empty.");
-            try
-            {
-                // ... Token Validation
-                var tokenValidation = new TokenValidationParameters
-                {
-                    ValidAudience = EndPoint,
-                    ValidIssuer = AppId,
-                    RequireExpirationTime = true,
-                    RequireSignedTokens = true,
-                    IssuerSigningKey = PublicKey
-                };
 
-                try
-                {
-                    new JsonWebTokenHandler().ValidateToken(token, tokenValidation);
-                    return true;
-                }
-                catch
-                {
-                    return false;
-                }
-            }
-            catch (Exception ex)
+            // ... Token Validation
+            var tokenValidation = new TokenValidationParameters
             {
-                throw new Exception("Failed in Validate Token, error " + ex.Message);
-            }
+                ValidAudience = EndPoint,
+                ValidIssuer = AppId,
+                RequireExpirationTime = true,
+                RequireSignedTokens = true,
+                IssuerSigningKey = PublicKey
+            };
+
+            // JsonWebTokenHandler reports failure through the result; it does not throw.
+            return new JsonWebTokenHandler().ValidateToken(token, tokenValidation).IsValid;
         }
 
         /// <summary>
-        /// Find certificate and set Keys from it
+        /// Releases the certificate.
         /// </summary>
-        private void FetchCertificate()
+        public void Dispose()
         {
-            X509Store store = new X509Store(StoreName.My, StoreLocation.CurrentUser);
+            X509Cert?.Dispose();
+        }
 
-            try
+        /// <summary>
+        /// Find a certificate with a private key in the current user's personal store.
+        /// </summary>
+        private static X509Certificate2 FindCertificate(string thumbprint)
+        {
+            using (var store = new X509Store(StoreName.My, StoreLocation.CurrentUser))
             {
-                try
-                {
-                    store.Open(OpenFlags.ReadOnly);
+                store.Open(OpenFlags.ReadOnly);
 
-                    var x509Collection = store.Certificates.Find(X509FindType.FindByThumbprint, Thumbprint, false);
-                    if (x509Collection == null || x509Collection.Count == 0)
-                        throw new Exception("No Certificate Found.");
+                var matches = store.Certificates.Find(X509FindType.FindByThumbprint, thumbprint, false);
+                if (matches.Count == 0)
+                    throw new CertificateException("No Certificate Found.");
 
-                    // ... Set Certificate
-                    X509Cert = x509Collection[0];
-                }
-                finally
+                var certificate = matches[0];
+                if (!certificate.HasPrivateKey)
                 {
-                    // ... Public Key to Validate JWT
-                    PublicKey = new RsaSecurityKey(X509Cert.GetRSAPublicKey());
-                    store.Close();
+                    certificate.Dispose();
+                    throw new CertificateException("The certificate does not have a private key.");
                 }
-            }
-            catch (Exception ex)
-            {
-                store.Close();
-                throw new Exception("Failed in Fetch Certificates, error " + ex.Message);
+
+                return certificate;
             }
         }
 
@@ -146,11 +145,6 @@ namespace MH_GenerateToken
         private string EndPoint { get; }
 
         /// <summary>
-        /// Certificate Thumbprint
-        /// </summary>
-        private string Thumbprint { get; }
-
-        /// <summary>
         /// Minutes for token to expire
         /// </summary>
         private double ExpiryMinutes { get; }
@@ -158,12 +152,12 @@ namespace MH_GenerateToken
         /// <summary>
         /// X509 Certificate to sign JWT
         /// </summary>
-        private X509Certificate2 X509Cert { get; set; }
+        private X509Certificate2 X509Cert { get; }
 
         /// <summary>
-        /// RSA Public Key from Certificate to Validate JWT
+        /// Certificate key to Validate JWT
         /// </summary>
-        private RsaSecurityKey PublicKey { get; set; }
+        private X509SecurityKey PublicKey { get; }
 
         #endregion
     }

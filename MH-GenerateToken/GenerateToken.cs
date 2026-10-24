@@ -1,4 +1,5 @@
 using System;
+using System.Text.RegularExpressions;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Azure.WebJobs;
@@ -15,101 +16,48 @@ namespace MH_GenerateToken
             [HttpTrigger(AuthorizationLevel.Function, "post", Route = null)] HttpRequest jwtReq,
             ILogger log)
         {
-            #region Query Strings
-
-            log.LogInformation("Generating Payload from query strings.");
-
             string appID = jwtReq.Query["appID"];
             string endpoint = jwtReq.Query["endpoint"];
             string thumbprint = jwtReq.Query["thumbprint"];
 
-            #endregion
+            if (string.IsNullOrWhiteSpace(appID) || string.IsNullOrWhiteSpace(endpoint) || string.IsNullOrWhiteSpace(thumbprint))
+                return new BadRequestObjectResult("Please pass appID, endpoint and thumbprint in the query string.");
 
-            #region Check for missing values
+            // Thumbprints copied from the certificate manager often contain spaces or hidden characters.
+            thumbprint = Regex.Replace(thumbprint, "[^0-9a-fA-F]", string.Empty);
 
-            if (appID == null || thumbprint == null || endpoint == null)
-                return new BadRequestObjectResult("Please pass required data in the query string.");
-
-            #endregion
-
-            #region Initialise Token Service
-
-            // ... Initialise JWT Service
-            TokenService service;
             try
             {
-                service = new TokenService(appID, endpoint, thumbprint);
-                log.LogInformation("Successfully initialised token service.");
-            }
-            catch (Exception ex)
-            {
-                log.LogInformation("Failed to initialise token service.");
-                return new OkObjectResult("Failed to initialise token service, encountered error: " + ex.Message);
-            }
-
-            #endregion
-
-            #region Generate Token
-
-            // ... Generate JWT Token
-            string generatedToken;
-            try
-            {
-                generatedToken = service.GenerateToken();
-                log.LogInformation("Token has been generated.");
-            }
-            catch (Exception ex)
-            {
-                log.LogInformation("Failed to generate token.");
-                return new OkObjectResult("Unable to generate token, encountered error: " + ex.Message);
-            }
-
-            #endregion
-
-            #region Validate Token
-
-            // ... Validate JWT Token
-            bool IsValid;
-            try
-            {
-                IsValid = service.ValidateJWT(generatedToken);
-            }
-            catch (Exception ex)
-            {
-                return new OkObjectResult("Unable to validate token, encountered error: " + ex.Message);
-            }
-
-            log.LogInformation("Token validation has been " + $"{(IsValid ? "successful." : "unsuccessful.")}");
-
-            #endregion
-
-            #region Parse token to JSON Object
-
-            // ... Parsing to JSON Object
-            string jsonResponse = null;
-            try
-            {
-                if (IsValid)
+                using (var service = new TokenService(appID, endpoint, thumbprint))
                 {
-                    jsonResponse = JsonConvert.SerializeObject(new { token = generatedToken });
-                    log.LogInformation("Serializing token string to a JSON object.");
+                    string generatedToken = service.GenerateToken();
+                    log.LogInformation("Token has been generated.");
+
+                    bool isValid = service.ValidateJWT(generatedToken);
+                    log.LogInformation("Token validation has been " + $"{(isValid ? "successful." : "unsuccessful.")}");
+
+                    if (!isValid)
+                        return new BadRequestObjectResult("Invalid Token Generated.");
+
+                    return new ContentResult
+                    {
+                        Content = JsonConvert.SerializeObject(new { token = generatedToken }),
+                        ContentType = "application/json",
+                        StatusCode = StatusCodes.Status200OK
+                    };
                 }
             }
+            catch (CertificateException ex)
+            {
+                log.LogWarning(ex.Message);
+                return new BadRequestObjectResult(ex.Message);
+            }
             catch (Exception ex)
             {
-                log.LogInformation("Failed to serialize token.");
-                return new OkObjectResult("Unable to serialize token, encountered error: " + ex.Message);
+                // Details go to the log only; callers get a failure status instead of a 200 with an error string.
+                log.LogError(ex, "Failed to generate token.");
+                return new ObjectResult("Unable to generate token.") { StatusCode = StatusCodes.Status500InternalServerError };
             }
-
-            #endregion
-
-            #region Return Token Response
-
-            return IsValid ?
-                (ActionResult)new OkObjectResult(jsonResponse)
-                : new BadRequestObjectResult("Invalid Token Generated.");
-
-            #endregion
         }
     }
 }
